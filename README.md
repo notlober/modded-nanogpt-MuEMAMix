@@ -1,4 +1,4 @@
-# Modded-NanoGPT
+# Modded-NanoGPT-MuEMAMix
 introducing MuEMAMix, mixing & outperforming previous sota work: Muon and AdEMAMix
 changes:
 1. code changed to use 4 rtx 4090 gpus with exact loss via gradient accumulation
