@@ -5,6 +5,8 @@ changes:
 1. code changed to use 4 rtx 4090 gpus with exact loss via gradient accumulation
 2. introduced and replace Muon with MuEMAMix
 
+![](img/muemamix_plot.png)
+
 # Modded-NanoGPT
 
 This repository hosts the *NanoGPT speedrun*, in which we (collaboratively|competitively) search for the fastest algorithm to use 8 NVIDIA H100 GPUs to train a language model that attains 3.28 cross-entropy loss on the [FineWeb](https://huggingface.co/datasets/HuggingFaceFW/fineweb) validation set.
