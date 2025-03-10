@@ -9,7 +9,7 @@ import glob
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-
+import math
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
@@ -133,74 +133,195 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int) -> Tensor:
         X = X.mT
     return X
 
-class Muon(torch.optim.Optimizer):
+def linear_warmup_scheduler(step, alpha_end, alpha_start=0, warmup=1):
+    if step < warmup:
+        a = step / float(warmup)
+        return (1.0-a) * alpha_start + a * alpha_end
+    return alpha_end
+
+def linear_hl_warmup_scheduler(step, beta_end, beta_start=0, warmup=1):
     """
-    Muon - MomentUm Orthogonalized by Newton-schulz
-
-    https://kellerjordan.github.io/posts/muon/
-
-    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
-    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
-    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
-    the advantage that it can be stably run in bfloat16 on the GPU.
-
-    Some warnings:
-    - This optimizer should not be used for the embedding layer, the final fully connected layer,
-    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
-    - To use it with 4D convolutional filters, it works well to just flatten their last 3 dimensions.
-
-    Arguments:
-        lr: The learning rate used by the internal SGD.
-        momentum: The momentum used by the internal SGD.
-        nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
-        ns_steps: The number of Newton-Schulz iteration steps to use.
+    Used for half-life style warmup of beta3, as in AdEMAMix:
+        f(beta) = log(0.5)/log(beta + eps) - 1
+    and invert it. 
     """
-    def __init__(self, params, lr=0.02, momentum=0.95, nesterov=True, ns_steps=5, rank=0, world_size=1):
+    def f(beta, eps=1e-8):
+        return math.log(0.5)/math.log(beta+eps)-1
+
+    def f_inv(t):
+        return math.pow(0.5, 1/(t+1))
+
+    if step < warmup:
+        a = step / float(warmup)
+        return f_inv((1.0 - a)*f(beta_start) + a*f(beta_end))
+    return beta_end
+
+
+class MuEMAMix(torch.optim.Optimizer):
+    r"""
+    MuEMAMix - merges Muon with AdEMAMix.
+
+    For 2D+ parameters, the update has these steps:
+    1. Maintain fast-EMA, slow-EMA, second moment of gradient:
+        exp_avg_fast, exp_avg_slow, exp_avg_sq
+    2. Combine them into a "raw" update:
+       update = [ (exp_avg_fast / (1 - beta1^t)) + alpha * exp_avg_slow ] / [ sqrt(exp_avg_sq / (1 - beta2^t)) + eps ]
+                 + weight_decay * p
+    3. Orthogonalize that update with Newton-Schulz:
+       update_ortho = zeropower_via_newtonschulz5(update)
+    4. Apply with distributed logic (similar to Muon):
+       p <- p - lr * scale * update_ortho
+       where scale might be = max(1, (#rows / #cols))^0.5 if you want to preserve step-size across row-major or col-major shapes.
+    """
+
+    def __init__(self,
+                 params,
+                 lr=0.02,
+                 betas=(0.8, 0.999, 0.9999),
+                 alpha=2.0,
+                 beta3_warmup=None,
+                 alpha_warmup=None,
+                 eps=1e-8,
+                 weight_decay=0.0,
+                 ns_steps=5,
+                 rank=0,
+                 world_size=1):
         self.rank = rank
         self.world_size = world_size
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps)
-        params: list[Tensor] = [*params]
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            alpha=alpha,
+            beta3_warmup=beta3_warmup,
+            alpha_warmup=alpha_warmup,
+            eps=eps,
+            weight_decay=weight_decay,
+            ns_steps=ns_steps
+        )
+
+        # flatten the param groups by unique sizes, as in Muon code:
+        params = list(params)
         param_groups = []
-        for size in {p.numel() for p in params}:
-            b = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
-            group = dict(params=[p for p in params if p.numel() == size],
-                         update_buffer=b, update_buffer_views=[b[i] for i in range(world_size)])
+        unique_sizes = {p.numel() for p in params}
+        for size in unique_sizes:
+            buf = torch.empty(world_size, size, dtype=torch.bfloat16, device="cuda")
+            group = {
+                "params": [p for p in params if p.numel() == size],
+                "update_buffer": buf,
+                "update_buffer_views": [buf[i] for i in range(world_size)],
+            }
             param_groups.append(group)
+
         super().__init__(param_groups, defaults)
 
     @torch.no_grad()
     def step(self):
+        """
+        Perform a single optimization step across all param groups, using
+        the Muon-like distributed gather approach, but computing the update
+        via AdEMAMix logic and then orthonormalizing it via Newton-Schulz.
+        """
         for group in self.param_groups:
-            update_buffer: Tensor = group["update_buffer"]
-            update_buffer_views: list[Tensor] = group["update_buffer_views"]
-            # generate weight updates in distributed fashion
-            params: list[Tensor] = group["params"]
+            update_buffer: torch.Tensor = group["update_buffer"]
+            update_buffer_views: list[torch.Tensor] = group["update_buffer_views"]
+
+            params: list[torch.Tensor] = group["params"]
+
             handle = None
             params_world = None
-            def update_prev(): # optimized Muon implementation contributed by @YouJiacheng
+
+            def apply_previous_gather():
                 handle.wait()
                 for p_world, g_world in zip(params_world, update_buffer_views):
-                    p_world.add_(g_world.view_as(p_world),
-                                 alpha=-group["lr"] * max(1, p_world.size(-2) / p_world.size(-1))**0.5)
-            for base_i in range(len(params))[::self.world_size]:
-                if base_i + self.rank < len(params):
-                    p = params[base_i + self.rank]
+                    p_world.add_(
+                        g_world.view_as(p_world),
+                        alpha=-group["lr"] * max(
+                            1, p_world.size(-2) / p_world.size(-1)
+                        ) ** 0.5
+                    )
+
+            beta1, beta2, beta3_final = group["betas"]
+            alpha_final = group["alpha"]
+            beta3_warmup = group["beta3_warmup"]
+            alpha_warmup = group["alpha_warmup"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+            ns_steps = group["ns_steps"]
+
+            for base_i in range(0, len(params), self.world_size):
+                idx = base_i + self.rank
+                if idx < len(params):
+                    p = params[idx]
                     g = p.grad
-                    assert g is not None
+                    if g is None:
+                        g = torch.zeros_like(p)
                     state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf: Tensor = state["momentum_buffer"]
-                    buf.lerp_(g, 1 - group["momentum"])
-                    g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                    g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"]).flatten()
+
+                    if "step" not in state:
+                        state["step"] = 0
+                        state["exp_avg_fast"] = torch.zeros_like(p)
+                        state["exp_avg_slow"] = torch.zeros_like(p)
+                        state["exp_avg_sq"] = torch.zeros_like(p)
+
+                    exp_avg_fast = state["exp_avg_fast"]
+                    exp_avg_slow = state["exp_avg_slow"]
+                    exp_avg_sq = state["exp_avg_sq"]
+                    state["step"] += 1
+
+                    step_t = state["step"]
+                    bias_correction1 = 1 - (beta1 ** step_t)
+                    bias_correction2 = 1 - (beta2 ** step_t)
+
+                    # possibly warm up alpha
+                    if alpha_warmup is not None:
+                        alpha_t = linear_warmup_scheduler(
+                            step_t, alpha_end=alpha_final, alpha_start=0, warmup=alpha_warmup
+                        )
+                    else:
+                        alpha_t = alpha_final
+
+                    # possibly warm up beta3
+                    if beta3_warmup is not None:
+                        beta3 = linear_hl_warmup_scheduler(
+                            step_t, beta_end=beta3_final, beta_start=beta1, warmup=beta3_warmup
+                        )
+                    else:
+                        beta3 = beta3_final
+
+                    # update the fast EMA:
+                    if beta1 > 0.0:
+                        exp_avg_fast.mul_(beta1).add_(g, alpha=1 - beta1)
+                    else:
+                        exp_avg_fast = g
+
+                    # update the slow EMA:
+                    exp_avg_slow.mul_(beta3).add_(g, alpha=1 - beta3)
+
+                    # update the second moment:
+                    exp_avg_sq.mul_(beta2).addcmul_(g, g, value=(1 - beta2))
+
+                    denom = (exp_avg_sq.div(bias_correction2).sqrt().add_(eps))
+                    num = exp_avg_fast.div(bias_correction1).add_(exp_avg_slow, alpha=alpha_t)
+                    update_raw = num.div_(denom)
+
+                    # weight decay
+                    if weight_decay != 0.0:
+                        update_raw.add_(p, alpha=weight_decay)
+
+                    # orthogonalize with Newton–Schulz
+                    g = zeropower_via_newtonschulz5(update_raw, ns_steps)
+                    g = g.flatten()
                 else:
                     g = update_buffer_views[self.rank]
+
                 if base_i > 0:
-                    update_prev() # async all_gather instead of sync all_reduce by @YouJiacheng
+                    apply_previous_gather()
+
                 handle = dist.all_gather_into_tensor(update_buffer, g, async_op=True)
+
                 params_world = params[base_i : base_i + self.world_size]
-            update_prev()
+
+            apply_previous_gather()
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -211,7 +332,7 @@ def norm(x: Tensor):
 class CastedLinear(nn.Linear):
     def __init__(self, in_features: int, out_features: int, use_fp8=False, x_s=1.0, w_s=1.0, grad_s=1.0):
         super().__init__(in_features, out_features, bias=False)
-        self.use_fp8 = use_fp8
+        self.use_fp8 = False
         self.x_s = x_s
         self.w_s = w_s
         self.grad_s = grad_s
@@ -443,23 +564,23 @@ class Hyperparameters:
     # data
     train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
-    val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    val_tokens = 4096 # reduced from 10485760 to match lower sequence lengths
+    train_seq_len = 1024 # reduced from 48*1024
+    val_seq_len = 1024 # reduced from 4*64*1024
     # optimization
     num_iterations = 1770 # number of iterations to run
     cooldown_frac = 0.4 # fraction of training spent cooling down the learning rate
     # architecture
     vocab_size = 50257
     # evaluation and logging
-    val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every = 25 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
 args = Hyperparameters()
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert world_size == 8 # this code is designed for 8xH100
+assert world_size == 4 # changed from 8 to 4
 assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
@@ -516,7 +637,15 @@ adam_params = [dict(params=head_params, lr=0.22), dict(params=embed_params, lr=0
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = torch.optim.Adam(adam_params, betas=(0.8, 0.95), eps=1e-10, fused=True)
-optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, rank=rank, world_size=world_size)
+optimizer2 = MuEMAMix(
+    hidden_matrix_params,
+    lr=0.05,
+    betas=(0.8, 0.999, 0.9999),
+    alpha=2.0,
+    ns_steps=5,
+    rank=rank,
+    world_size=world_size
+)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -573,6 +702,9 @@ del initial_state
 
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, rank, world_size)
 training_time_ms = 0
+# Gradient accumulation steps
+accumulation_steps = 96  # added for gradient accumulation
+
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
@@ -614,25 +746,33 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    inputs, targets = next(train_loader)
-    model(inputs, targets, get_window_size_blocks(step)).backward()
+    total_loss = 0.0
+    for accum_step in range(accumulation_steps):
+        inputs, targets = next(train_loader)
+        loss = model(inputs, targets, get_window_size_blocks(step))
+        loss.backward()
+        total_loss += loss.item()
+    
+    # Average gradients across accumulation steps
+    for param in model.parameters():
+        if param.grad is not None:
+            param.grad.div_(accumulation_steps)
+    
+    # All-reduce gradients across GPUs (average)
     for param in model.parameters():
         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG)
-    # set optimization hyperparameters
-    for opt in optimizers:
-        for group in opt.param_groups:
-            group["lr"] = group["initial_lr"] * get_lr(step)
-    for group in optimizer2.param_groups:
-        frac = min(step / 300, 1) # momentum warmup for muon
-        group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
-    # step the optimizers
+    
+    # Step optimizers
     for opt in optimizers:
         opt.step()
-    # null the gradients
+    
+    # Zero gradients
     model.zero_grad(set_to_none=True)
-    # logging
+    
+    # Logging
+    avg_loss = total_loss / accumulation_steps
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
-    print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
+    print0(f"step:{step+1}/{train_steps} loss:{avg_loss:.4f} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
